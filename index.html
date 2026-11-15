@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Influenz und Polarisation</title>
+<style>
+  :root { color-scheme: light; --ink:#111; --bg:#fff; --muted:#555; --line:#cfcfcf; --accent:#1a4fa0; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif; }
+  main { max-width:920px; margin:0 auto; padding:16px; }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 12px; }
+  .controls { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:12px; }
+  label { font-weight:600; }
+  select, button { font:inherit; padding:8px 12px; border:2px solid var(--ink); background:#fff;
+                   color:var(--ink); border-radius:8px; }
+  button { cursor:pointer; }
+  select:hover, button:hover { background:#f1f1f1; }
+  select:focus-visible, button:focus-visible { outline:3px solid var(--accent); outline-offset:2px; }
+  .stage { border:2px solid var(--ink); border-radius:10px; background:#fff; overflow:hidden;
+           width:min(100%, max(380px, calc((100vh - 340px) * 700 / 420))); margin:0 auto; }
+  svg { display:block; width:100%; height:auto; touch-action:none; user-select:none; -webkit-user-select:none; }
+  svg text { font-family:inherit; }
+  #balloon { cursor:grab; }
+  #balloon.drag { cursor:grabbing; }
+  #balloon:focus { outline:none; }
+  #balloon:focus-visible .focusring { stroke:var(--accent); stroke-width:3; stroke-dasharray:6 5; }
+  .info { margin-top:12px; padding:12px 14px; border:1px solid var(--line); border-radius:8px; }
+  .info p { margin:0 0 8px; }
+  .info p:last-child { margin:0; }
+  #state { font-weight:600; min-height:3em; }
+  .note { color:var(--muted); font-size:.92rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Influenz und Polarisation</h1>
+  <p class="sub">Ziehe den geladenen Luftballon mit der Maus oder dem Finger (oder mit den Pfeiltasten) in die Nähe des zweiten Gegenstands.</p>
+
+  <div class="controls">
+    <label for="mode">Versuch:</label>
+    <select id="mode">
+      <option value="influenz">Influenz (Tischtennisball mit Graphit)</option>
+      <option value="polarisation">Polarisation (Papierschnipsel)</option>
+    </select>
+    <button id="reset" type="button">Zurücksetzen</button>
+  </div>
+
+  <div class="stage">
+    <svg id="svg" viewBox="0 20 700 420" role="img"
+         aria-label="Animation: Ein negativ geladener Luftballon wird einem ungeladenen Gegenstand angenähert.">
+      <defs>
+        <marker id="arrow" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="10" refX="11" refY="5" orient="auto">
+          <path d="M0,0 L12,5 L0,10 z" fill="#000"/>
+        </marker>
+      </defs>
+      <rect width="700" height="440" fill="#fff"/>
+      <g id="pend"></g>
+      <g id="balloon" tabindex="0" role="application"
+         aria-label="Luftballon, negativ geladen. Mit den Pfeiltasten verschiebbar.">
+        <ellipse class="focusring" rx="80" ry="96" fill="none" stroke="transparent"/>
+        <ellipse rx="72" ry="88" fill="#fff" stroke="#000" stroke-width="3"/>
+        <path d="M-8,88 L8,88 L0,101 Z" fill="#000"/>
+        <g id="balloonCharges" stroke="#000" stroke-width="2.5"></g>
+        <text y="124" text-anchor="middle" font-size="18">Luftballon</text>
+      </g>
+      <g id="force"></g>
+      <g id="labels"></g>
+    </svg>
+  </div>
+
+  <div class="info" aria-live="polite">
+    <p id="modeText"></p>
+    <p id="state"></p>
+    <p class="note" id="note"></p>
+  </div>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ---------- Konstanten ---------- */
+  var NS = 'http://www.w3.org/2000/svg';
+  var W = 700, H = 420, VBY = 20;
+  var PIV = { x: 520, y: 40 };           // Aufhängepunkt
+  var START = { x: 140, y: 230 };        // Startposition des Luftballons
+  var RX = 72, RY = 88;                  // Halbachsen des Luftballons
+  var BX0 = RX + 10, BX1 = W - RX - 10, BY0 = 100, BY1 = 300;
+  var GRAV = 1400, DAMP = 2.2, FMAX = 2.4, CONTACT = 5;
+  var REACHV = 270, FULLV = 90;          // Ladungsverschiebung / Ausrichtung: sichtbar ab 270 px, voll bei 90 px Abstand
+  var REACHF = 110;                      // Kraft spürbar erst ab 110 px Abstand
+
+  var svg = document.getElementById('svg');
+  var pend = document.getElementById('pend');
+  var forceG = document.getElementById('force');
+  var labelsG = document.getElementById('labels');
+  var balloonG = document.getElementById('balloon');
+  var balloonCharges = document.getElementById('balloonCharges');
+  var modeSel = document.getElementById('mode');
+  var modeText = document.getElementById('modeText');
+  var stateText = document.getElementById('state');
+  var noteText = document.getElementById('note');
+
+  function el(tag, attrs, parent) {
+    var e = document.createElementNS(NS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  function plusPath(x, y, s) { x = +x; y = +y; return 'M' + (x - s) + ' ' + y + 'H' + (x + s) + 'M' + x + ' ' + (y - s) + 'V' + (y + s); }
+  function minusPath(x, y, s) { x = +x; y = +y; return 'M' + (x - s) + ' ' + y + 'H' + (x + s); }
+
+  /* ---------- Luftballon: neun negative Ladungen ---------- */
+  [[-28,-50],[17,-65],[-8,-10],[27,-20],[-31,25],[12,30],[42,20],[-11,60],[27,57]].forEach(function (p) {
+    el('path', { d: minusPath(p[0], p[1], 7), fill: 'none' }, balloonCharges);
+  });
+
+  /* ---------- Zustand ---------- */
+  var mode = 'influenz';
+  var balloon = { x: START.x, y: START.y };
+  var phi = 0, omega = 0, nd = 0, fcur = 0, time = 0;
+  var obj = null;                         // aktuelles Objekt (Aufbau + update)
+
+  /* ---------- Abtastpunkte der Luftballon-Kontur ---------- */
+  var SAMPLES = [];
+  for (var i = 0; i < 96; i++) {
+    var t = i / 96 * 2 * Math.PI;
+    SAMPLES.push([Math.cos(t) * RX, Math.sin(t) * RY]);
+  }
+
+  /* ---------- Die beiden Versuche ---------- */
+  var MODES = {
+    influenz: {
+      L: 190,
+      dist: function (x, y) { return Math.hypot(x, y) - 40; },
+      ray: function () { return 40; },
+      labelOff: 52,
+      text: 'Der Tischtennisball ist mit Graphit überzogen, also ein Leiter: Seine Ladungen sind frei beweglich. Insgesamt ist er ungeladen (gleich viele positive und negative Ladungen).',
+      note: 'Hinweis: Positive und negative Ladungen sind als „+“ und „−“ dargestellt. Es sind nur wenige Ladungen gezeichnet, in Wirklichkeit sind es sehr viele.',
+      states: {
+        none: 'Ziehe den Luftballon in die Nähe des Balls.',
+        mid: 'Die Ladungen im Ball verschieben sich: Die positiven wandern zum Luftballon hin, die negativen von ihm weg. Insgesamt bleibt der Ball ungeladen. Die Kraft ist noch zu klein, um den Ball zu bewegen.',
+        high: 'Die positiven Ladungen sind dem Luftballon jetzt näher als die negativen. Die Anziehung überwiegt: Der Ball wird zum Luftballon gezogen.',
+        contact: 'Berührung. Bei einem echten Versuch würden sich jetzt Ladungen ausgleichen (siehe Ladungspendel).'
+      },
+      build: function () {
+        var o = {};
+        el('line', { x1: PIV.x - 40, y1: PIV.y, x2: PIV.x + 40, y2: PIV.y, stroke: '#000', 'stroke-width': 6 }, pend);
+        el('line', { x1: PIV.x, y1: PIV.y, x2: PIV.x, y2: PIV.y + 215, stroke: '#000', 'stroke-width': 1, 'stroke-dasharray': '5,4' }, pend);
+        o.thread = el('line', { x1: PIV.x, y1: PIV.y, x2: PIV.x, y2: PIV.y + 190, stroke: '#000', 'stroke-width': 2 }, pend);
+        o.ball = el('circle', { r: 40, fill: '#fff', stroke: '#000', 'stroke-width': 3 }, pend);
+        // Ruhepositionen (gemischt, Schachbrett) und Zielpositionen (getrennt)
+        o.plusRest  = [[-16,-12],[16,-12],[0,12]];  o.plusTy  = [-14, 14, 0];
+        o.minusRest = [[0,-12],[-16,12],[16,12]];   o.minusTy = [0, -14, 14];
+        o.plus = []; o.minus = [];
+        for (var k = 0; k < 3; k++) {
+          o.plus.push(el('path', { fill: 'none', stroke: '#000', 'stroke-width': 2.4 }, pend));
+          o.minus.push(el('path', { fill: 'none', stroke: '#000', 'stroke-width': 2.4 }, pend));
+        }
+        o.label = el('text', { 'text-anchor': 'middle', 'font-size': 18, fill: '#000', stroke: '#fff', 'stroke-width': 5, 'paint-order': 'stroke' }, labelsG);
+        o.label.textContent = 'Tischtennisball';
+        return o;
+      },
+      update: function (o, c, u, nd) {
+        o.thread.setAttribute('x2', c.x); o.thread.setAttribute('y2', c.y);
+        o.ball.setAttribute('cx', c.x); o.ball.setAttribute('cy', c.y);
+        var th = Math.atan2(u.y, u.x), cs = Math.cos(th), sn = Math.sin(th);
+        for (var k = 0; k < 3; k++) {
+          var pr = o.plusRest[k], mr = o.minusRest[k];
+          var pt = [20 * cs - o.plusTy[k] * sn,  20 * sn + o.plusTy[k] * cs];
+          var mt = [-20 * cs - o.minusTy[k] * sn, -20 * sn + o.minusTy[k] * cs];
+          var px = c.x + pr[0] + (pt[0] - pr[0]) * nd, py = c.y + pr[1] + (pt[1] - pr[1]) * nd;
+          var mx = c.x + mr[0] + (mt[0] - mr[0]) * nd, my = c.y + mr[1] + (mt[1] - mr[1]) * nd;
+          o.plus[k].setAttribute('d', plusPath(px.toFixed(1), py.toFixed(1), 5.5));
+          o.minus[k].setAttribute('d', minusPath(mx.toFixed(1), my.toFixed(1), 5.5));
+        }
+        o.label.setAttribute('x', c.x); o.label.setAttribute('y', c.y + 40 + 24);
+      }
+    },
+
+    polarisation: {
+      L: 200,
+      dist: function (x, y) {
+        var dx = Math.abs(x) - 70, dy = Math.abs(y) - 58;
+        if (dx > 0 || dy > 0) return Math.hypot(Math.max(dx, 0), Math.max(dy, 0));
+        return Math.max(dx, dy);
+      },
+      ray: function (u) {
+        return Math.min(70 / Math.max(Math.abs(u.x), 1e-6), 58 / Math.max(Math.abs(u.y), 1e-6));
+      },
+      text: 'Das Papier ist ein Isolator: Seine Ladungen können nicht wandern. Aber die Moleküle sind polar (ein Ende leicht positiv, das andere leicht negativ) und können sich drehen.',
+      note: 'Hinweis: Die Moleküle sind stark vergrößert gezeichnet. In Wirklichkeit richten sie sich nur zum Teil aus.',
+      states: {
+        none: 'Ziehe den Luftballon in die Nähe des Papierschnipsels.',
+        mid: 'Die polaren Moleküle richten sich im Feld des Luftballons aus: Ihre positiven Enden zeigen zum Luftballon. Die Kraft ist noch zu klein, um das Papier zu bewegen.',
+        high: 'Die positiven Enden der Moleküle zeigen zum Luftballon. Sie sind näher als die negativen Enden: Die Anziehung überwiegt.',
+        contact: 'Das Papier haftet am Luftballon.'
+      },
+      build: function () {
+        var o = {};
+        el('line', { x1: PIV.x - 40, y1: PIV.y, x2: PIV.x + 40, y2: PIV.y, stroke: '#000', 'stroke-width': 6 }, pend);
+        el('line', { x1: PIV.x, y1: PIV.y, x2: PIV.x, y2: PIV.y + 265, stroke: '#000', 'stroke-width': 1, 'stroke-dasharray': '5,4' }, pend);
+        o.thread = el('line', { stroke: '#000', 'stroke-width': 2 }, pend);
+        o.rect = el('rect', { width: 140, height: 116, fill: '#fff', stroke: '#000', 'stroke-width': 3 }, pend);
+        o.mols = [];
+        var cols = [-42, 0, 42], rows = [-36, 0, 36];
+        var a0 = [25, 140, 255, 80, 200, 310, 170, 45, 290];
+        var idx = 0;
+        for (var r = 0; r < 3; r++) for (var c = 0; c < 3; c++) {
+          var g = el('g', {}, pend);
+          el('rect', { x: -17, y: -10, width: 34, height: 20, rx: 10, fill: '#fff', stroke: '#000', 'stroke-width': 1.8 }, g);
+          el('line', { x1: 0, y1: -10, x2: 0, y2: 10, stroke: '#000', 'stroke-width': 1 }, g);
+          el('path', { d: 'M3.5 0H13.5M8.5 -5V5', fill: 'none', stroke: '#000', 'stroke-width': 2.2 }, g);
+          el('path', { d: 'M-13.5 0H-3.5', fill: 'none', stroke: '#000', 'stroke-width': 2.2 }, g);
+          o.mols.push({ g: g, dx: cols[c], dy: rows[r], a0: a0[idx], w: 1.5 + (idx * 0.37) % 1.6, ph: idx * 1.7 });
+          idx++;
+        }
+        o.label = el('text', { 'text-anchor': 'middle', 'font-size': 18, fill: '#000', stroke: '#fff', 'stroke-width': 5, 'paint-order': 'stroke' }, labelsG);
+        o.label.textContent = 'Papierschnipsel';
+        return o;
+      },
+      update: function (o, c, u, nd, t) {
+        o.thread.setAttribute('x1', PIV.x); o.thread.setAttribute('y1', PIV.y);
+        o.thread.setAttribute('x2', c.x); o.thread.setAttribute('y2', c.y - 58);
+        o.rect.setAttribute('x', c.x - 70); o.rect.setAttribute('y', c.y - 58);
+        var at = Math.atan2(u.y, u.x) * 180 / Math.PI;
+        for (var i = 0; i < o.mols.length; i++) {
+          var m = o.mols[i];
+          var d = ((at - m.a0 + 540) % 360) - 180;
+          var ang = m.a0 + d * nd + 28 * (1 - 0.85 * nd) * Math.sin(t * m.w + m.ph);
+          m.g.setAttribute('transform', 'translate(' + (c.x + m.dx).toFixed(1) + ' ' + (c.y + m.dy).toFixed(1) + ') rotate(' + ang.toFixed(1) + ')');
+        }
+        o.label.setAttribute('x', c.x); o.label.setAttribute('y', c.y + 58 + 24);
+      }
+    }
+  };
+
+  /* ---------- Geometrie ---------- */
+  function center(m, p) { return { x: PIV.x + m.L * Math.sin(p), y: PIV.y + m.L * Math.cos(p) }; }
+
+  function gapAt(bx, by, p) {
+    var m = MODES[mode], c = center(m, p), best = Infinity;
+    var ex = (c.x - bx) / RX, ey = (c.y - by) / RY;
+    if (ex * ex + ey * ey < 1) return -1;     // Objekt liegt ganz im Luftballon
+    for (var i = 0; i < SAMPLES.length; i++) {
+      var d = m.dist(bx + SAMPLES[i][0] - c.x, by + SAMPLES[i][1] - c.y);
+      if (d < best) best = d;
+    }
+    return best;
+  }
+
+  /* ---------- Aufbau / Zurücksetzen ---------- */
+  function setMode(name) {
+    mode = name;
+    pend.textContent = '';
+    forceG.textContent = '';
+    labelsG.textContent = '';
+    obj = MODES[mode].build();
+    obj.arrow = el('line', { stroke: '#000', 'stroke-width': 2.5, 'marker-end': 'url(#arrow)', visibility: 'hidden' }, forceG);
+    obj.flabel = el('text', { 'text-anchor': 'middle', 'font-size': 17, fill: '#000', stroke: '#fff', 'stroke-width': 4,
+                              'paint-order': 'stroke', visibility: 'hidden' }, forceG);
+    obj.flabel.textContent = 'elektrische Kraft';
+    modeText.textContent = MODES[mode].text;
+    noteText.textContent = MODES[mode].note;
+    lastState = '';
+    reset();
+  }
+  var lastState = '';
+  function reset() {
+    balloon.x = START.x; balloon.y = START.y;
+    phi = 0; omega = 0; nd = 0; fcur = 0;
+  }
+
+  /* ---------- Physik ---------- */
+  function simulate(dt) {
+    var m = MODES[mode];
+    var gap0 = gapAt(balloon.x, balloon.y, phi);
+    var vT = clamp((REACHV - gap0) / (REACHV - FULLV), 0, 1);
+    vT = vT * vT * (3 - 2 * vT);
+    nd += (vT - nd) * (1 - Math.exp(-dt / 0.18));
+    fcur = nd * Math.pow(Math.max(0, 1 - gap0 / REACHF), 2);
+
+    var sub = 4, h = dt / sub;
+    for (var k = 0; k < sub; k++) {
+      var c = center(m, phi);
+      var ux = balloon.x - c.x, uy = balloon.y - c.y, dl = Math.hypot(ux, uy) || 1;
+      ux /= dl; uy /= dl;
+      var F = FMAX * GRAV * fcur;
+      var acc = (-GRAV * Math.sin(phi) + F * (ux * Math.cos(phi) - uy * Math.sin(phi))) / m.L - DAMP * omega;
+      omega += acc * h;
+      var dphi = omega * h;
+      var np = clamp(phi + dphi, -1.2, 1.2);
+      if (gapAt(balloon.x, balloon.y, np) < 0) {
+        var lo = 0, hi = 1;
+        for (var j = 0; j < 7; j++) {
+          var mid = (lo + hi) / 2;
+          if (gapAt(balloon.x, balloon.y, phi + mid * dphi) < 0) hi = mid; else lo = mid;
+        }
+        phi += lo * dphi;
+        omega = 0;
+      } else {
+        phi = np;
+      }
+    }
+  }
+
+  /* ---------- Darstellung ---------- */
+  function render() {
+    var m = MODES[mode];
+    var c = center(m, phi);
+    balloonG.setAttribute('transform', 'translate(' + balloon.x.toFixed(1) + ' ' + balloon.y.toFixed(1) + ')');
+
+    var ux = balloon.x - c.x, uy = balloon.y - c.y, dl = Math.hypot(ux, uy) || 1;
+    var u = { x: ux / dl, y: uy / dl };
+    var gap = gapAt(balloon.x, balloon.y, phi);
+    m.update(obj, c, u, nd, time);
+
+    // Kraftpfeil
+    var ray = m.ray(u);
+    var len = Math.min(20 + 90 * Math.min(1, fcur * 3), gap - 12);
+    if (fcur > 0.02 && len >= 16) {
+      var sx = c.x + u.x * (ray + 6), sy = c.y + u.y * (ray + 6);
+      obj.arrow.setAttribute('x1', sx); obj.arrow.setAttribute('y1', sy);
+      obj.arrow.setAttribute('x2', sx + u.x * len); obj.arrow.setAttribute('y2', sy + u.y * len);
+      obj.arrow.setAttribute('visibility', 'visible');
+      obj.flabel.setAttribute('text-anchor', u.x < 0 ? 'end' : 'start');
+      obj.flabel.setAttribute('x', clamp(sx, 130, W - 130));
+      obj.flabel.setAttribute('y', sy + u.y * len / 2 - 12);
+      obj.flabel.setAttribute('visibility', 'visible');
+    } else {
+      obj.arrow.setAttribute('visibility', 'hidden');
+      obj.flabel.setAttribute('visibility', 'hidden');
+    }
+
+    // Erklärtext zum aktuellen Zustand
+    var s = gap < CONTACT && nd > 0.5 ? 'contact' : fcur > 0.04 ? 'high' : nd > 0.06 ? 'mid' : 'none';
+    if (s !== lastState) { stateText.textContent = m.states[s]; lastState = s; }
+  }
+
+  /* ---------- Bedienung ---------- */
+  function toSvg(e) {
+    var r = svg.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * W / r.width, y: VBY + (e.clientY - r.top) * H / r.height };
+  }
+  function free(x, y) { return gapAt(x, y, phi) >= 0; }
+  function moveBalloon(tx, ty) {
+    tx = clamp(tx, BX0, BX1); ty = clamp(ty, BY0, BY1);
+    if (free(tx, ty)) { balloon.x = tx; balloon.y = ty; return; }
+    if (free(tx, balloon.y)) { balloon.x = tx; return; }
+    if (free(balloon.x, ty)) { balloon.y = ty; return; }
+    var lo = 0, hi = 1, x0 = balloon.x, y0 = balloon.y;
+    for (var i = 0; i < 8; i++) {
+      var mid = (lo + hi) / 2;
+      if (free(x0 + (tx - x0) * mid, y0 + (ty - y0) * mid)) lo = mid; else hi = mid;
+    }
+    balloon.x = x0 + (tx - x0) * lo; balloon.y = y0 + (ty - y0) * lo;
+  }
+
+  var drag = null;
+  balloonG.addEventListener('pointerdown', function (e) {
+    var p = toSvg(e);
+    drag = { dx: balloon.x - p.x, dy: balloon.y - p.y };
+    try { balloonG.setPointerCapture(e.pointerId); } catch (err) {}
+    balloonG.classList.add('drag');
+    e.preventDefault();
+  });
+  balloonG.addEventListener('pointermove', function (e) {
+    if (!drag) return;
+    var p = toSvg(e);
+    moveBalloon(p.x + drag.dx, p.y + drag.dy);
+  });
+  function endDrag() { drag = null; balloonG.classList.remove('drag'); }
+  balloonG.addEventListener('pointerup', endDrag);
+  balloonG.addEventListener('pointercancel', endDrag);
+  balloonG.addEventListener('keydown', function (e) {
+    var step = 12, dx = 0, dy = 0;
+    if (e.key === 'ArrowLeft') dx = -step; else if (e.key === 'ArrowRight') dx = step;
+    else if (e.key === 'ArrowUp') dy = -step; else if (e.key === 'ArrowDown') dy = step;
+    else return;
+    e.preventDefault();
+    moveBalloon(balloon.x + dx, balloon.y + dy);
+  });
+
+  modeSel.addEventListener('change', function () { setMode(modeSel.value); });
+  document.getElementById('reset').addEventListener('click', reset);
+
+  /* ---------- Start ---------- */
+  setMode('influenz');
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.033, (now - last) / 1000);
+    last = now; time += dt;
+    simulate(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
